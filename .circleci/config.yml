@@ -19,6 +19,14 @@ jobs:
       - run:
          name: Unit tests
          command: make test
+  build:
+    docker:
+      - image: circleci/golang:1.13.1
+    steps:
+      - checkout
+      - run:
+         name: Build Manager
+         command: make manager
   e2e:
     machine:
       image: circleci/classic:latest
@@ -55,3 +63,4 @@ workflows:
       - verify
       - test
       - e2e
+      - build
