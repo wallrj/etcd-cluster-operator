@@ -39,6 +39,9 @@ spec:
                 the etcd pods. As per the etcd documentation, etcd will ignore bootstrap
                 instructions if it already knows where it's peers are.
               properties:
+                discoverySrv:
+                  description: DNS name used as the suffix for DNS discovery https://github.com/etcd-io/etcd/blob/master/Documentation/op-guide/clustering.md#dns-discovery
+                  type: string
                 initialClusterState:
                   description: "This is passed through directly to the underlying
                     etcd instance as the `ETCD_INITIAL_CLUSTER_STATE` envvar or `--initial-cluster-state`

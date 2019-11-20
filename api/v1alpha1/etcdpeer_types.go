@@ -39,7 +39,10 @@ type Bootstrap struct {
 	// other peers ahead of time.
 	// +optional
 	Static *StaticBootstrap `json:"static,omitempty"`
-
+	// DNS name used as the suffix for DNS discovery
+	// https://github.com/etcd-io/etcd/blob/master/Documentation/op-guide/clustering.md#dns-discovery
+	// +optional
+	DiscoverySrv string `json:"discoverySrv,omitempty"`
 	// This is passed through directly to the underlying etcd instance as the `ETCD_INITIAL_CLUSTER_STATE` envvar or
 	// `--initial-cluster-state` flag. Like all bootstrap instructions, this is ignored if the data directory already
 	// exists, which for us is if an underlying persistent volume already exists.
