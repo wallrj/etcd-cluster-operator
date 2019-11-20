@@ -131,6 +131,10 @@ func defineReplicaSet(peer etcdv1alpha1.EtcdPeer) appsv1.ReplicaSet {
 							Image: etcdImage,
 							Env: []corev1.EnvVar{
 								{
+									Name:  etcdenvvar.DiscoverySrv,
+									Value: peer.Spec.Bootstrap.DiscoverySrv,
+								},
+								{
 									Name:  etcdenvvar.InitialCluster,
 									Value: staticBootstrapInitialCluster(*peer.Spec.Bootstrap.Static),
 								},
