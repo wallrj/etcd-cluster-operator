@@ -551,6 +551,7 @@ func configurePeerBootstrap(peer *etcdv1alpha1.EtcdPeer, cluster *etcdv1alpha1.E
 		Static: &etcdv1alpha1.StaticBootstrap{
 			InitialCluster: initialClusterMembers(cluster),
 		},
+		DiscoverySrv:        cluster.ClusterName,
 		InitialClusterState: etcdv1alpha1.InitialClusterStateNew,
 	}
 }
