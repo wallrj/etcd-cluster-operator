@@ -1,21 +1,17 @@
+// +build e2e
+
 package e2e
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
-	"os/signal"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -25,15 +21,10 @@ import (
 	etcd "go.etcd.io/etcd/clientv3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/pointer"
-	kindv1alpha3 "sigs.k8s.io/kind/pkg/apis/config/v1alpha3"
-	"sigs.k8s.io/kind/pkg/cluster"
-	"sigs.k8s.io/kind/pkg/cluster/create"
-	"sigs.k8s.io/kind/pkg/container/cri"
 
 	semver "github.com/coreos/go-semver/semver"
 	etcdv1alpha1 "github.com/improbable-eng/etcd-cluster-operator/api/v1alpha1"
@@ -46,13 +37,8 @@ const (
 )
 
 var (
-	fUseKind           = flag.Bool("kind", false, "Creates a Kind cluster to run the tests against.")
-	fOutputDirectory   = flag.String("output-directory", "/tmp/etcd-e2e", "The absolute path to a directory where E2E results logs will be saved.")
-	fKindClusterName   = flag.String("kind-cluster-name", "etcd-e2e", "The name of the Kind cluster to use or create")
-	fControllerImage   = flag.String("controller-image", "", "The name of the controller image")
-	fUseCurrentContext = flag.Bool("current-context", false, "Runs the tests against the current Kubernetes context, the path to kube config defaults to ~/.kube/config, unless overridden by the KUBECONFIG environment variable.")
-	fRepoRoot          = flag.String("repo-root", "", "The absolute path to the root of the etcd-cluster-operator git repository.")
-	fCleanup           = flag.Bool("cleanup", true, "Tears down the Kind cluster once the test is finished.")
+	fOutputDirectory = flag.String("output-directory", "/tmp/etcd-e2e", "The absolute path to a directory where E2E results logs will be saved.")
+	fRepoRoot        = flag.String("repo-root", "", "The absolute path to the root of the etcd-cluster-operator git repository.")
 )
 
 func objFromYaml(objBytes []byte) (runtime.Object, error) {
@@ -86,204 +72,6 @@ func getSpec(t *testing.T, o interface{}) interface{} {
 	return nil
 }
 
-// Starts a Kind cluster on the local machine, exposing port 2379 accepting ETCD connections.
-func startKind(t *testing.T, ctx context.Context, stopped chan struct{}) (kind *cluster.Context, err error) {
-	clusterExists := true
-	// Only attempt to delete the cluster if we created it.
-	// But always ensure that the stopped channel gets closed when the context
-	// ends or is cancelled.
-	go func() {
-		defer close(stopped)
-		<-ctx.Done()
-		if kind == nil {
-			return
-		}
-		t.Log("Collecting Kind logs.")
-		err := kind.CollectLogs(path.Join(*fOutputDirectory, "kind"))
-		assert.NoError(t, err, "failed to collect Kind logs")
-		if !*fCleanup {
-			t.Log("Not deleting Kind cluster because --cleanup=false")
-			return
-		}
-		if clusterExists {
-			t.Log("Not deleting Kind cluster because this was an existing cluster.")
-			return
-		}
-		t.Log("Deleting Kind cluster.")
-		err = kind.Delete()
-		assert.NoError(t, err)
-	}()
-
-	clusters, err := cluster.List()
-	if err != nil {
-		return nil, err
-	}
-	for _, kind := range clusters {
-		if kind.Name() == *fKindClusterName {
-			t.Log("Found existing Kind cluster")
-			return &kind, nil
-		}
-	}
-	clusterExists = false
-	t.Log("Starting new Kind cluster")
-	kind = cluster.NewContext(*fKindClusterName)
-	err = kind.Create(create.WithV1Alpha3(&kindv1alpha3.Cluster{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Cluster",
-			APIVersion: "kind.sigs.k8s.io/v1alpha3",
-		},
-		Nodes: []kindv1alpha3.Node{
-			{
-				Role: "control-plane",
-				ExtraPortMappings: []cri.PortMapping{
-					{
-						ContainerPort: 32379,
-						HostPort:      2379,
-					},
-				},
-			},
-		},
-	}))
-	if err != nil {
-		return nil, err
-	}
-	return kind, nil
-}
-
-func buildOperator(t *testing.T, ctx context.Context) (imageTar string, err error) {
-	t.Log("Building the operator")
-
-	// Build the operator.
-	out, err := exec.CommandContext(ctx, "make", "-C", *fRepoRoot, "docker-build").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w Output: %s", err, string(out))
-	}
-
-	// Bundle the image to a tar.
-	tmpDir, err := ioutil.TempDir("", "etcd-cluster-operator-e2e-test")
-	if err != nil {
-		return "", err
-	}
-
-	imageTar = filepath.Join(tmpDir, "etcd-cluster-operator.tar")
-
-	t.Log("Exporting the operator image")
-	out, err = exec.CommandContext(ctx, "docker", "save", "-o", imageTar, *fControllerImage).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w Output: %s", err, out)
-	}
-	return imageTar, nil
-}
-
-func installOperator(t *testing.T, ctx context.Context, kubectl *kubectlContext, kind *cluster.Context, imageTar string) {
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t.Log("Deleting test namespaces")
-		DeleteAllTestNamespaces(t, kubectl)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t.Log("Deleting etcd-cluster-operator namespace")
-		err := kubectl.Delete("namespace", "eco-system", "--ignore-not-found")
-		require.NoError(t, err)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t.Log("Installing cert-manager")
-		out, err := exec.CommandContext(ctx, "make", "-C", *fRepoRoot, "deploy-cert-manager").CombinedOutput()
-		require.NoError(t, err, string(out))
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// Ensure CRDs exist in the cluster.
-		t.Log("Applying CRDs")
-		err := kubectl.Apply("--kustomize", filepath.Join(*fRepoRoot, "config", "crd"))
-		require.NoError(t, err)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		imageFile, err := os.Open(imageTar)
-		require.NoError(t, err)
-		defer func() {
-			assert.NoError(t, imageFile.Close(), "failed to close operator image tar")
-		}()
-		// Load the built image into the Kind cluster.
-		t.Log("Loading image in to Kind cluster")
-		nodes, err := kind.ListInternalNodes()
-		require.NoError(t, err)
-		for _, node := range nodes {
-			err := node.LoadImageArchive(imageFile)
-			require.NoError(t, err)
-		}
-	}()
-
-	wg.Wait()
-
-	t.Log("Deploying controller")
-	out, err := exec.CommandContext(ctx, "make", "-C", *fRepoRoot, "deploy-controller").CombinedOutput()
-	require.NoError(t, err, string(out))
-}
-
-func setupKind(t *testing.T, ctx context.Context, stopped chan struct{}) *kubectlContext {
-	ctx, cancel := context.WithCancel(ctx)
-	var (
-		kind     *cluster.Context
-		imageTar string
-		wg       sync.WaitGroup
-	)
-	stoppedKind := make(chan struct{})
-	go func() {
-		<-stoppedKind
-		close(stopped)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var err error
-		imageTar, err = buildOperator(t, ctx)
-		if err != nil {
-			assert.NoError(t, err)
-			cancel()
-		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var err error
-		kind, err = startKind(t, ctx, stoppedKind)
-		if err != nil {
-			assert.NoError(t, err)
-			cancel()
-		}
-	}()
-
-	wg.Wait()
-	require.NoError(t, ctx.Err())
-	kubectl := &kubectlContext{
-		t:          t,
-		configPath: kind.KubeConfigPath(),
-	}
-
-	t.Log("Setting the environment variable KUBECONFIG", kubectl.configPath)
-	err := os.Setenv("KUBECONFIG", kubectl.configPath)
-	require.NoError(t, err)
-
-	installOperator(t, ctx, kubectl, kind, imageTar)
-
-	return kubectl
-}
-
 func setupCurrentContext(t *testing.T) *kubectlContext {
 	home, err := os.UserHomeDir()
 	require.NoError(t, err)
@@ -298,26 +86,7 @@ func setupCurrentContext(t *testing.T) *kubectlContext {
 }
 
 func TestE2E(t *testing.T) {
-	var kubectl *kubectlContext
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigs := make(chan os.Signal)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		cancel()
-	}()
-	switch {
-	case *fUseKind:
-		stoppedKind := make(chan struct{})
-		defer func() { <-stoppedKind }()
-		defer cancel()
-		kubectl = setupKind(t, ctx, stoppedKind)
-	case *fUseCurrentContext:
-		kubectl = setupCurrentContext(t)
-	default:
-		t.Skip("Supply either --kind or --current-context to run E2E tests")
-	}
+	kubectl := setupCurrentContext(t)
 
 	// Delete all existing test namespaces, to free up resources before running new tests.
 	DeleteAllTestNamespaces(t, kubectl)

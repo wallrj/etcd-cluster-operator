@@ -1,4 +1,10 @@
+MAKEFLAGS += --warn-undefined-variables
+SHELL := bash
+.SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := help
+.DELETE_ON_ERROR:
+.SUFFIXES:
+
 # The version which will be reported by the --version argument of each binary
 # and which will be used as the Docker image tag
 VERSION ?= $(shell git describe --tags)
@@ -10,13 +16,13 @@ DOCKER_IMAGES ?= controller controller-debug proxy backup-agent
 DOCKER_IMAGE_NAME_PREFIX ?= etcd-cluster-operator-
 # The Docker image for the controller-manager which will be deployed to the cluster in tests
 CONTROLLER_NAME := controller$(if ${DEBUG},-debug,)
-DOCKER_IMAGE_CONTROLLER := ${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}${CONTROLLER_NAME}
 
 BUILD_DIR ?= .build
 BUILD_DIR_IMAGES := ${BUILD_DIR}/images
 
 # Set DEBUG=TRUE to use debug Docker images and to show debugging output
 DEBUG ?=
+ARGS ?=
 
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:trivialVersions=true"
@@ -47,8 +53,8 @@ endif
 
 DOCKER_FQN=${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}${IMAGE}:${DOCKER_TAG}
 IID_FILE=${BUILD_DIR_IMAGES}/${IMAGE}.iid
-IID=$(subst sha256:,,$(file < ${IID_FILE}))
-DOCKER_FQDN_WITH_IID=${DOCKER_FQN}-${IID}
+IID=$(subst sha256:,,$(shell cat ${IID_FILE}))
+DOCKER_FQN_WITH_IID=${DOCKER_FQN}-${IID}
 
 # from https://suva.sh/posts/well-documented-makefiles/
 .PHONY: help
@@ -70,24 +76,23 @@ test: ## Run unit tests
 test: bin/kubebuilder
 	KUBEBUILDER_ASSETS="$(shell pwd)/bin/kubebuilder/bin" go test ./... -coverprofile cover.out $(ARGS)
 
-.PHONY: e2e-kind
-e2e-kind: ## Run end to end tests - creates a new Kind cluster called etcd-e2e
-e2e-kind: IMAGE=${CONTROLLER_NAME}
-e2e-kind: ${BUILD_DIR_IMAGES} docker-build-${IMAGE}
-	go test -v -parallel ${TEST_PARALLEL_E2E} -timeout 20m ./internal/test/e2e \
-			--kind \
-			--repo-root ${CURDIR} \
-			--cleanup=${CLEANUP} \
-			--controller-image=${DOCKER_FQDN_WITH_IID} \
-			$(ARGS)
-# We do not clean up after running the tests to
-#  a) speed up the test run time slightly
-#  b) allow debug sessions to be attached to figure out what caused failures
+.PHONY: kind
+kind:
+	kind create cluster --quiet
+
+.PHONY: kind-load
+kind-load: ## Load all the Docker images into Kind
+kind-load: $(addprefix kind-load-,$(DOCKER_IMAGES))
+
+kind-load-%: IMAGE=$*
+kind-load-%: FORCE
+	kind load docker-image ${DOCKER_FQN_WITH_IID}
+FORCE:
 
 .PHONY: e2e
 e2e: ## Run the end-to-end tests - uses the current KUBE_CONFIG and context
 e2e:
-	go test -parallel ${TEST_PARALLEL_E2E} -timeout 30m ./internal/test/e2e --current-context --repo-root ${CURDIR} -v $(ARGS)
+	go test -tags=e2e -parallel ${TEST_PARALLEL_E2E} -timeout 30m ./internal/test/e2e --repo-root ${CURDIR} -v $(ARGS)
 
 .PHONY: manager
 manager: ## Build manager binary
@@ -113,7 +118,7 @@ deploy-cert-manager: ## Deploy cert-manager in the configured Kubernetes cluster
 kustomize-edit: ## Update the config/ manifests to use the latest controller image
 kustomize-edit: IMAGE=${CONTROLLER_NAME}
 kustomize-edit: ${BUILD_DIR_IMAGES} docker-build-${CONTROLLER_NAME}
-	cd config/manager && kustomize edit set image controller=${DOCKER_FQDN_WITH_IID}
+	cd config/manager && kustomize edit set image controller=${DOCKER_FQN_WITH_IID}
 
 .PHONY: deploy-controller
 deploy-controller: ## Deploy controller in the configured Kubernetes cluster in ~/.kube/config
@@ -180,7 +185,7 @@ FORCE:
 
 docker-build-%: IMAGE=$*
 docker-build-%: FORCE ${BUILD_DIR_IMAGES} .docker-build-%
-	docker tag ${IID} ${DOCKER_FQDN_WITH_IID}
+	docker tag ${IID} ${DOCKER_FQN_WITH_IID}
 FORCE:
 
 .PHONY: docker-push
@@ -189,7 +194,7 @@ docker-push: $(addprefix docker-push-,$(DOCKER_IMAGES))
 
 docker-push-%: IMAGE=$*
 docker-push-%: FORCE
-	docker push ${DOCKER_FQDN_WITH_IID}
+	docker push ${DOCKER_FQN_WITH_IID}
 FORCE:
 
 .PHONY: controller-gen

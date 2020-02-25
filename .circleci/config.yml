@@ -5,7 +5,7 @@ version: 2
 jobs:
   verify:
     machine:
-      image: circleci/classic:latest
+      image: ubuntu-1604:201903-01
     steps:
       - run:
           name: Install Go
@@ -30,7 +30,7 @@ jobs:
          command: make test
   e2e:
     machine:
-      image: circleci/classic:latest
+      image: ubuntu-1604:201903-01
     working_directory: ~/go/src/github.com/improbable-eng/etcd-cluster-operator
     steps:
       - run:
@@ -57,11 +57,17 @@ jobs:
             curl -L -o /tmp/kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v3.5.4/kustomize_v3.5.4_linux_amd64.tar.gz
             echo "5cdeb2af81090ad428e3a94b39779b3e477e2bc946be1fe28714d1ca28502f6a  /tmp/kustomize.tar.gz" | sha256sum -c
             sudo tar -C /usr/local/bin -x -f /tmp/kustomize.tar.gz
+      - run:
+          name: Install kind
+          command: |
+            curl -L -o /tmp/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.7.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            sudo mv /tmp/kind /usr/local/bin/
       - checkout
       - run:
          name: End to end tests
          # Limit parallelism of E2E tests to avoid overloading the CircleCI
-         command: make e2e-kind TEST_PARALLEL_E2E=1
+         command: make --debug kind docker-build kind-load deploy e2e TEST_PARALLEL_E2E=1 DEBUG=1
       - store_artifacts:
           path: /tmp/etcd-e2e
 
