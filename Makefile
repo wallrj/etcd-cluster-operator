@@ -9,7 +9,11 @@ DOCKER_REPO ?= quay.io/improbable-eng
 DOCKER_IMAGES ?= controller controller-debug proxy backup-agent
 DOCKER_IMAGE_NAME_PREFIX ?= etcd-cluster-operator-
 # The Docker image for the controller-manager which will be deployed to the cluster in tests
-DOCKER_IMAGE_CONTROLLER := ${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}controller$(if $DEBUG,-debug,):${DOCKER_TAG}
+CONTROLLER_NAME := controller$(if ${DEBUG},-debug,)
+DOCKER_IMAGE_CONTROLLER := ${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}${CONTROLLER_NAME}
+
+BUILD_DIR ?= .build
+BUILD_DIR_IMAGES := ${BUILD_DIR}/images
 
 # Set DEBUG=TRUE to use debug Docker images and to show debugging output
 DEBUG ?=
@@ -41,6 +45,11 @@ else
 CLEANUP="true"
 endif
 
+DOCKER_FQN=${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}${IMAGE}:${DOCKER_TAG}
+IID_FILE=${BUILD_DIR_IMAGES}/${IMAGE}.iid
+IID=$(subst sha256:,,$(file < ${IID_FILE}))
+DOCKER_FQDN_WITH_IID=${DOCKER_FQN}-${IID}
+
 # from https://suva.sh/posts/well-documented-makefiles/
 .PHONY: help
 help: ## Display this help
@@ -63,11 +72,13 @@ test: bin/kubebuilder
 
 .PHONY: e2e-kind
 e2e-kind: ## Run end to end tests - creates a new Kind cluster called etcd-e2e
+e2e-kind: IMAGE=${CONTROLLER_NAME}
+e2e-kind: ${BUILD_DIR_IMAGES} docker-build-${IMAGE}
 	go test -v -parallel ${TEST_PARALLEL_E2E} -timeout 20m ./internal/test/e2e \
 			--kind \
 			--repo-root ${CURDIR} \
 			--cleanup=${CLEANUP} \
-			--controller-image=${DOCKER_IMAGE_CONTROLLER} \
+			--controller-image=${DOCKER_FQDN_WITH_IID} \
 			$(ARGS)
 # We do not clean up after running the tests to
 #  a) speed up the test run time slightly
@@ -98,9 +109,15 @@ deploy-cert-manager: ## Deploy cert-manager in the configured Kubernetes cluster
 	kubectl apply --validate=false --filename=https://github.com/jetstack/cert-manager/releases/download/v0.11.0/cert-manager.yaml
 	kubectl wait --for=condition=Available --timeout=300s apiservice v1beta1.webhook.cert-manager.io
 
+.PHONY: kustomize-edit
+kustomize-edit: ## Update the config/ manifests to use the latest controller image
+kustomize-edit: IMAGE=${CONTROLLER_NAME}
+kustomize-edit: ${BUILD_DIR_IMAGES} docker-build-${CONTROLLER_NAME}
+	cd config/manager && kustomize edit set image controller=${DOCKER_FQDN_WITH_IID}
+
 .PHONY: deploy-controller
 deploy-controller: ## Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-	cd config/manager && kustomize edit set image controller=${DOCKER_IMAGE_CONTROLLER}
+deploy-controller: kustomize-edit
 	kustomize build config/default | kubectl apply -f -
 	kubectl --namespace eco-system wait --for=condition=Available --timeout=300s deploy eco-controller-manager
 
@@ -155,16 +172,24 @@ go-get-patch: ## Update Golang dependencies to latest patch versions
 docker-build: ## Build the all the docker images
 docker-build: $(addprefix docker-build-,$(DOCKER_IMAGES))
 
-docker-build-%: FORCE
-	docker build . $(if ${DEBUG},,--quiet) --target $* --build-arg VERSION=$(VERSION) --tag ${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}$*:${DOCKER_TAG}
+.docker-build-%:
+.docker-build-%: IMAGE=$*
+.docker-build-%: FORCE
+	docker build . $(if ${DEBUG},,--quiet) --target ${IMAGE} --build-arg VERSION=$(VERSION) --iidfile ${IID_FILE}
+FORCE:
+
+docker-build-%: IMAGE=$*
+docker-build-%: FORCE ${BUILD_DIR_IMAGES} .docker-build-%
+	docker tag ${IID} ${DOCKER_FQDN_WITH_IID}
 FORCE:
 
 .PHONY: docker-push
 docker-push: ## Push all the docker images
 docker-push: $(addprefix docker-push-,$(DOCKER_IMAGES))
 
+docker-push-%: IMAGE=$*
 docker-push-%: FORCE
-	docker push ${DOCKER_REPO}/${DOCKER_IMAGE_NAME_PREFIX}$*:${DOCKER_TAG}
+	docker push ${DOCKER_FQDN_WITH_IID}
 FORCE:
 
 .PHONY: controller-gen
@@ -182,3 +207,6 @@ endif
 verify-%: FORCE
 	./hack/verify.sh make -s $*
 FORCE:
+
+${BUILD_DIR}/%:
+	mkdir -p ${BUILD_DIR}/$*
